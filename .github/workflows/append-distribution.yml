@@ -1,0 +1,130 @@
+name: append-distribution
+
+# Triggered desde labstest via:
+#   POST /repos/anderplanner/saiso-bundle-distribution-log/dispatches
+#   {"event_type":"saiso-bundle-distribution","client_payload":{...}}
+#
+# Crea branch + commit (vía Contents API → commit auto-firmado por GitHub) +
+# PR + merge. Respeta el ruleset 'protect-main-append-only' que exige
+# linear history, signed commits y PR para cambios a main.
+
+on:
+  repository_dispatch:
+    types: [saiso-bundle-distribution]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: append-distribution
+  cancel-in-progress: false
+
+jobs:
+  append:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate payload
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          echo "$PAYLOAD" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+required=("version","channel","bundle_sha256","criticality","distributed_to_tenants","signed_by","timestamp_utc")
+missing=[k for k in required if k not in d]
+if missing:
+  print(f"::error::missing client_payload fields: {missing}", file=sys.stderr); sys.exit(1)
+if not isinstance(d["distributed_to_tenants"], list):
+  print("::error::distributed_to_tenants must be a list", file=sys.stderr); sys.exit(1)
+if d["criticality"] not in ("normal","critical"):
+  print(f"::error::invalid criticality: {d[\"criticality\"]}", file=sys.stderr); sys.exit(1)
+print("payload validated")'
+
+      - name: Build and append JSONL line
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/${REPO}"
+          AUTH=("-H" "Authorization: Bearer ${GH_TOKEN}" "-H" "Accept: application/vnd.github+json" "-H" "X-GitHub-Api-Version: 2022-11-28")
+
+          # 1) Construir línea JSONL determinística (claves ordenadas).
+          LINE=$(echo "$PAYLOAD" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+out={k:d[k] for k in sorted(d)}
+print(json.dumps(out, separators=(",",":"), ensure_ascii=False, sort_keys=True))')
+          echo "appending: $LINE"
+
+          # 2) Leer log.jsonl actual (404 ⇒ archivo nuevo).
+          PREV_RESP=$(curl -sS "${AUTH[@]}" "${API}/contents/log.jsonl?ref=main")
+          PREV_SHA=$(echo "$PREV_RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("sha",""))' 2>/dev/null || true)
+          PREV_CONTENT=""
+          if [ -n "$PREV_SHA" ]; then
+            PREV_CONTENT=$(echo "$PREV_RESP" | python3 -c 'import json,sys,base64
+d=json.load(sys.stdin); print(base64.b64decode(d["content"]).decode("utf-8"))' 2>/dev/null || true)
+          fi
+          NEW_CONTENT="${PREV_CONTENT}${LINE}
+"
+          NEW_B64=$(printf '%s' "$NEW_CONTENT" | base64 -w0)
+
+          # 3) Crear branch desde main.
+          MAIN_SHA=$(curl -sS "${AUTH[@]}" "${API}/git/ref/heads/main" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["object"]["sha"])')
+          TS=$(date -u +%Y%m%d-%H%M%S)
+          BRANCH="bot/append-${TS}-${GITHUB_RUN_ID}"
+          curl -fsS "${AUTH[@]}" -X POST "${API}/git/refs" \
+            -d "$(python3 -c "import json,sys; print(json.dumps({'ref': 'refs/heads/$BRANCH', 'sha': '$MAIN_SHA'}))")" \
+            >/dev/null
+          echo "branch=$BRANCH"
+
+          # 4) PUT contents en el branch (server-side commit, auto-firmado).
+          VERSION=$(echo "$PAYLOAD" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+          MSG="append: bundle ${VERSION} (sha7=$(echo $PAYLOAD | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"bundle_sha256\"][:7])'))"
+          BODY=$(python3 -c "
+import json,sys
+d={'message':'$MSG','content':'$NEW_B64','branch':'$BRANCH'}
+prev='$PREV_SHA'
+if prev: d['sha']=prev
+print(json.dumps(d))")
+          curl -fsS "${AUTH[@]}" -X PUT "${API}/contents/log.jsonl" -d "$BODY" >/dev/null
+          echo "commit pushed to $BRANCH"
+
+          # 5) Abrir PR contra main.
+          PR_BODY=$(python3 -c "
+import json
+print(json.dumps({
+  'title': 'append: bundle distribution log entry',
+  'head': '$BRANCH',
+  'base': 'main',
+  'body': 'Automated append by append-distribution workflow.\n\nDispatched from labstest manager.\nWorkflow run: ${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}'
+}))")
+          PR_RESP=$(curl -fsS "${AUTH[@]}" -X POST "${API}/pulls" -d "$PR_BODY")
+          PR_NUM=$(echo "$PR_RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["number"])')
+          echo "pr=#$PR_NUM"
+
+          # 6) Merge inmediato (squash). El ruleset acepta porque required_approving_review_count=0.
+          MERGE_BODY=$(python3 -c "
+import json
+print(json.dumps({'merge_method':'squash','commit_title':'$MSG'}))")
+          for attempt in 1 2 3 4 5; do
+            HTTP=$(curl -sS "${AUTH[@]}" -o /tmp/merge.out -w "%{http_code}" \
+              -X PUT "${API}/pulls/${PR_NUM}/merge" -d "$MERGE_BODY")
+            if [ "$HTTP" = "200" ]; then
+              echo "merged on attempt $attempt"
+              break
+            fi
+            echo "merge attempt $attempt rc=$HTTP body=$(cat /tmp/merge.out)"
+            sleep $(( attempt * 5 ))
+          done
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::merge failed after retries"
+            cat /tmp/merge.out
+            exit 1
+          fi
+
+          # 7) Cleanup branch.
+          curl -fsS "${AUTH[@]}" -X DELETE "${API}/git/refs/heads/${BRANCH}" || true
+          echo "branch deleted; append complete"
