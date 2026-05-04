@@ -4,9 +4,13 @@ name: append-distribution
 #   POST /repos/anderplanner/saiso-bundle-distribution-log/dispatches
 #   {"event_type":"saiso-bundle-distribution","client_payload":{...}}
 #
-# Crea branch + commit (vía Contents API → commit auto-firmado por GitHub) +
-# PR + merge. Respeta el ruleset 'protect-main-append-only' que exige
-# linear history, signed commits y PR para cambios a main.
+# Append directo a log.jsonl en main via Contents API. El ruleset
+# 'protect-main-append-only' enforza:
+#   - required_signatures (Contents API genera commits server-side firmados)
+#   - required_linear_history (no merges)
+#   - non_fast_forward (no rewriting)
+#   - deletion (no deletes)
+# Solo el flujo append es posible — apto para transparency log.
 
 on:
   repository_dispatch:
@@ -14,7 +18,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 concurrency:
   group: append-distribution
@@ -50,13 +53,11 @@ jobs:
           CHANNEL=$(echo "$PAYLOAD" | jq -r '.channel')
           echo "payload validated: version=$VERSION channel=$CHANNEL"
 
-      - name: Append JSONL line via API (branch + PR + merge)
+      - name: Append JSONL line on main via Contents API
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PAYLOAD: ${{ toJson(github.event.client_payload) }}
-          RUN_ID: ${{ github.run_id }}
-          SERVER_URL: ${{ github.server_url }}
         run: |
           set -euo pipefail
           API="https://api.github.com/repos/${REPO}"
@@ -66,67 +67,42 @@ jobs:
           LINE=$(echo "$PAYLOAD" | jq -cS .)
           echo "appending: $LINE"
 
-          # 2) Leer log.jsonl actual (404 ⇒ archivo nuevo).
-          PREV=$(curl -sS "${AUTH[@]}" "${API}/contents/log.jsonl?ref=main")
-          PREV_SHA=$(echo "$PREV" | jq -r 'if type=="object" and has("sha") then .sha else "" end')
-          PREV_CONTENT=""
-          if [ -n "$PREV_SHA" ]; then
-            PREV_CONTENT=$(echo "$PREV" | jq -r '.content' | base64 -d)
-          fi
-          NEW_CONTENT=$(printf '%s%s\n' "$PREV_CONTENT" "$LINE")
-          NEW_B64=$(printf '%s' "$NEW_CONTENT" | base64 -w0)
-
-          # 3) Crear branch desde main.
-          MAIN_SHA=$(curl -sS "${AUTH[@]}" "${API}/git/ref/heads/main" | jq -r '.object.sha')
-          TS=$(date -u +%Y%m%d-%H%M%S)
-          BRANCH="bot/append-${TS}-${RUN_ID}"
-          curl -fsS "${AUTH[@]}" -X POST "${API}/git/refs" \
-            -d "$(jq -nc --arg ref "refs/heads/${BRANCH}" --arg sha "${MAIN_SHA}" '{ref:$ref,sha:$sha}')" \
-            >/dev/null
-          echo "branch=${BRANCH}"
-
-          # 4) PUT contents en el branch (server-side commit, auto-firmado).
           VERSION=$(echo "$PAYLOAD" | jq -r '.version')
-          SHA7=$(echo "$PAYLOAD" | jq -r '.bundle_sha256[:7]')
+          SHA7=$(echo "$PAYLOAD" | jq -r '.bundle_sha256[0:7]')
           MSG="append: bundle ${VERSION} (sha7=${SHA7})"
-          PUT_BODY=$(jq -nc \
-            --arg msg "$MSG" \
-            --arg content "$NEW_B64" \
-            --arg branch "$BRANCH" \
-            --arg prev "$PREV_SHA" \
-            'if $prev == "" then {message:$msg, content:$content, branch:$branch}
-             else {message:$msg, content:$content, branch:$branch, sha:$prev} end')
-          curl -fsS "${AUTH[@]}" -X PUT "${API}/contents/log.jsonl" -d "$PUT_BODY" >/dev/null
-          echo "commit pushed to ${BRANCH}"
 
-          # 5) Abrir PR contra main.
-          PR_BODY=$(jq -nc \
-            --arg title "$MSG" \
-            --arg head "$BRANCH" \
-            --arg body "Automated append.\n\nWorkflow run: ${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}" \
-            '{title:$title, head:$head, base:"main", body:$body}')
-          PR_RESP=$(curl -fsS "${AUTH[@]}" -X POST "${API}/pulls" -d "$PR_BODY")
-          PR_NUM=$(echo "$PR_RESP" | jq -r '.number')
-          echo "pr=#${PR_NUM}"
-
-          # 6) Merge inmediato (squash).
-          MERGE_BODY=$(jq -nc --arg t "$MSG" '{merge_method:"squash", commit_title:$t}')
+          # Reintentos por carrera con otros dispatch (concurrency:group ya
+          # serializa, pero ante 409 SHA conflict reintentamos leyendo de nuevo).
           for attempt in 1 2 3 4 5; do
-            HTTP=$(curl -sS "${AUTH[@]}" -o /tmp/merge.out -w "%{http_code}" \
-              -X PUT "${API}/pulls/${PR_NUM}/merge" -d "$MERGE_BODY")
-            if [ "$HTTP" = "200" ]; then
-              echo "merged on attempt $attempt"
-              break
+            PREV=$(curl -sS "${AUTH[@]}" "${API}/contents/log.jsonl?ref=main")
+            PREV_TYPE=$(echo "$PREV" | jq -r 'type')
+            PREV_SHA=""
+            PREV_CONTENT=""
+            if [ "$PREV_TYPE" = "object" ]; then
+              PREV_SHA=$(echo "$PREV" | jq -r 'if has("sha") then .sha else "" end')
+              if [ -n "$PREV_SHA" ]; then
+                PREV_CONTENT=$(echo "$PREV" | jq -r '.content' | base64 -d)
+              fi
             fi
-            echo "merge attempt $attempt rc=${HTTP} body=$(cat /tmp/merge.out)"
-            sleep $(( attempt * 5 ))
-          done
-          if [ "${HTTP}" != "200" ]; then
-            echo "::error::merge failed after retries"
-            cat /tmp/merge.out
-            exit 1
-          fi
+            NEW_CONTENT=$(printf '%s%s\n' "$PREV_CONTENT" "$LINE")
+            NEW_B64=$(printf '%s' "$NEW_CONTENT" | base64 -w0)
 
-          # 7) Cleanup branch.
-          curl -fsS "${AUTH[@]}" -X DELETE "${API}/git/refs/heads/${BRANCH}" || true
-          echo "branch deleted; append complete"
+            PUT_BODY=$(jq -nc \
+              --arg msg "$MSG" \
+              --arg content "$NEW_B64" \
+              --arg prev "$PREV_SHA" \
+              'if $prev == "" then {message:$msg, content:$content, branch:"main"}
+               else {message:$msg, content:$content, branch:"main", sha:$prev} end')
+
+            HTTP=$(curl -sS "${AUTH[@]}" -o /tmp/put.out -w "%{http_code}" \
+              -X PUT "${API}/contents/log.jsonl" -d "$PUT_BODY")
+            if [ "$HTTP" = "200" ] || [ "$HTTP" = "201" ]; then
+              echo "appended on attempt $attempt"
+              jq -r '.commit.sha' /tmp/put.out
+              exit 0
+            fi
+            echo "attempt $attempt failed rc=$HTTP body=$(cat /tmp/put.out)"
+            sleep $(( attempt * 3 ))
+          done
+          echo "::error::append failed after retries"
+          exit 1
