@@ -29,13 +29,13 @@ jobs:
           PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
           set -euo pipefail
-          required='["version","channel","bundle_sha256","criticality","distributed_to_tenants","signed_by","timestamp_utc"]'
-          MISSING=$(echo "$PAYLOAD" | jq -r --argjson req "$required" '[$req[] | select(. as $k | ($input | has($k) | not))] | @csv' --slurpfile input <(echo "$PAYLOAD") 2>/dev/null \
-            || echo "$PAYLOAD" | jq -r --argjson req "$required" '[. as $d | $req[] | select($d | has(.) | not)] | join(",")')
-          if [ -n "$MISSING" ]; then
-            echo "::error::missing client_payload fields: $MISSING"
-            exit 1
-          fi
+          for k in version channel bundle_sha256 criticality distributed_to_tenants signed_by timestamp_utc; do
+            v=$(echo "$PAYLOAD" | jq -r --arg k "$k" 'if has($k) then "ok" else "missing" end')
+            if [ "$v" = "missing" ]; then
+              echo "::error::missing client_payload field: $k"
+              exit 1
+            fi
+          done
           CRIT=$(echo "$PAYLOAD" | jq -r '.criticality')
           if [ "$CRIT" != "normal" ] && [ "$CRIT" != "critical" ]; then
             echo "::error::invalid criticality: $CRIT"
@@ -46,7 +46,9 @@ jobs:
             echo "::error::distributed_to_tenants must be a list (got $IS_LIST)"
             exit 1
           fi
-          echo "payload validated: version=$(echo "$PAYLOAD" | jq -r '.version') channel=$(echo "$PAYLOAD" | jq -r '.channel')"
+          VERSION=$(echo "$PAYLOAD" | jq -r '.version')
+          CHANNEL=$(echo "$PAYLOAD" | jq -r '.channel')
+          echo "payload validated: version=$VERSION channel=$CHANNEL"
 
       - name: Append JSONL line via API (branch + PR + merge)
         env:
